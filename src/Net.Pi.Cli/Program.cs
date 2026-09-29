@@ -1,6 +1,7 @@
 using Net.Pi.Ai;
 using Net.Pi.Ai.Models;
 using Net.Pi.Core;
+using Net.Pi.Core.Sessions;
 using Net.Pi.Core.Skills;
 using Net.Pi.Tools;
 using Net.Pi.Tui;
@@ -18,6 +19,7 @@ Console.WriteLine(Ansi.GrayText(" Lightweight, Deterministic Agent Toolkit for .
 Console.WriteLine(Ansi.GrayText(" ------------------------------------------------------------------\n"));
 
 var isMock = args.Contains("--mock");
+var isAskMode = args.Contains("--ask");
 var apiKey = Environment.GetEnvironmentVariable("NET_PI_API_KEY") 
              ?? Environment.GetEnvironmentVariable("OPENAI_API_KEY") 
              ?? Environment.GetEnvironmentVariable("DEEPSEEK_API_KEY")
@@ -36,7 +38,6 @@ if (isMock || string.IsNullOrWhiteSpace(apiKey))
     Console.WriteLine(Ansi.GrayText("   Set OPENAI_API_KEY or NET_PI_API_KEY to connect to real LLM providers.\n"));
 
     var mock = new MockLlmClient { DefaultModel = "net-pi-simulator" };
-    // Provide a sample tool-use flow in mock mode
     mock.EnqueueResponse(history =>
     {
         var last = history.LastOrDefault()?.Content ?? "";
@@ -76,7 +77,27 @@ if (skillManager.Skills.Count > 0)
     Console.WriteLine(Ansi.GreenText($"✓ Loaded {skillManager.Skills.Count} skill(s): {string.Join(", ", skillManager.Skills.Select(s => s.Name))}\n"));
 }
 
-// 2. Register all tools with workspace boundaries
+// 2. Load Project-Specific Instructions (AGENTS.md / CLAUDE.md)
+var (projectInstructions, instructionsPath) = ProjectInstructionsLoader.FindAndLoad(currentDir);
+if (!string.IsNullOrEmpty(instructionsPath))
+{
+    Console.WriteLine(Ansi.GreenText($"✓ Loaded project instructions from {Path.GetFileName(instructionsPath)}\n"));
+}
+
+// 3. Permission Confirmation Gate
+Func<string, Task<bool>>? confirmationGate = null;
+if (isAskMode)
+{
+    Console.WriteLine(Ansi.YellowText("🔒 Permission gate active: destructive tools require approval.\n"));
+    confirmationGate = cmd =>
+    {
+        Console.Write(Ansi.Color($"\n⚡ [Permission Gate] Allow command: \"{cmd}\"? (y/N): ", Ansi.Yellow + Ansi.Bold));
+        var answer = Console.ReadLine()?.Trim().ToLowerInvariant();
+        return Task.FromResult(answer == "y" || answer == "yes");
+    };
+}
+
+// 4. Register all tools with workspace boundaries
 var tools = new ITool[]
 {
     new ReadFileTool(currentDir),
@@ -89,7 +110,7 @@ var tools = new ITool[]
     new WebFetchTool(),
     new AgentBrowserTool(),
     new ReadSkillTool(skillManager),
-    new ExecuteCommandTool(currentDir)
+    new ExecuteCommandTool(currentDir, confirmationGate)
 };
 
 var systemPrompt = $"""
@@ -115,6 +136,11 @@ Conventions:
 {skillManager.BuildCatalogPrompt()}
 """;
 
+if (!string.IsNullOrEmpty(projectInstructions))
+{
+    systemPrompt += $"\n\n# Project Instructions (from {Path.GetFileName(instructionsPath)}):\n{projectInstructions}";
+}
+
 var loop = new AgentLoop(llmClient, tools, new AgentLoopOptions
 {
     SystemPrompt = systemPrompt,
@@ -122,6 +148,38 @@ var loop = new AgentLoop(llmClient, tools, new AgentLoopOptions
 });
 
 var renderer = new AgentConsoleRenderer();
+var sessionStore = new SessionStore(currentDir);
+SessionData currentSession;
+
+// 5. Session Resume Handling (--resume [sessionId])
+var resumeIndex = Array.FindIndex(args, a => a.Equals("--resume", StringComparison.OrdinalIgnoreCase));
+if (resumeIndex != -1)
+{
+    SessionData? loaded = null;
+    if (resumeIndex + 1 < args.Length && !args[resumeIndex + 1].StartsWith("--"))
+    {
+        var candidateId = args[resumeIndex + 1];
+        loaded = sessionStore.LoadSession(candidateId);
+    }
+
+    loaded ??= sessionStore.GetLatestSession();
+
+    if (loaded != null)
+    {
+        currentSession = loaded;
+        loop.RestoreFromHistory(loaded.Messages);
+        Console.WriteLine(Ansi.GreenText($"✓ Resumed session '{loaded.Id}' with {loaded.Messages.Count} historical message(s).\n"));
+    }
+    else
+    {
+        Console.WriteLine(Ansi.YellowText($"⚠️  No existing session found to resume. Started fresh session.\n"));
+        currentSession = sessionStore.CreateSession(model, currentDir);
+    }
+}
+else
+{
+    currentSession = sessionStore.CreateSession(model, currentDir);
+}
 
 // Setup Ctrl+C cancellation handler
 CancellationTokenSource? currentTurnCts = null;
@@ -145,6 +203,8 @@ if (!string.IsNullOrWhiteSpace(promptArg))
     try
     {
         await renderer.RenderStreamAsync(loop.RunAsync(promptArg, singleCts.Token), singleCts.Token);
+        currentSession.Messages = loop.History.ToList();
+        sessionStore.SaveSession(currentSession);
     }
     finally
     {
@@ -154,7 +214,7 @@ if (!string.IsNullOrWhiteSpace(promptArg))
 }
 
 // Interactive REPL Mode
-Console.WriteLine(Ansi.Color("Commands: /clear (clear screen), /reset (clear session history), /history (token stats), exit\n", Ansi.Gray));
+Console.WriteLine(Ansi.Color("Commands: /clear (screen), /reset (history), /history (tokens), /sessions (list), exit\n", Ansi.Gray));
 
 while (true)
 {
@@ -180,8 +240,9 @@ while (true)
     if (trimmed.Equals("/reset", StringComparison.OrdinalIgnoreCase) || trimmed.Equals("reset", StringComparison.OrdinalIgnoreCase))
     {
         loop.ResetHistory();
+        currentSession = sessionStore.CreateSession(model, currentDir);
         Console.Clear();
-        Console.WriteLine(Ansi.YellowText("✓ Session history reset. Fresh conversation started.\n"));
+        Console.WriteLine(Ansi.YellowText("✓ Session reset. Fresh conversation started.\n"));
         continue;
     }
 
@@ -192,12 +253,27 @@ while (true)
         continue;
     }
 
+    if (trimmed.Equals("/sessions", StringComparison.OrdinalIgnoreCase))
+    {
+        var sessions = sessionStore.ListSessions(10);
+        Console.WriteLine(Ansi.CyanText($"\nSaved sessions in .net-pi/sessions ({sessions.Count} found):"));
+        foreach (var s in sessions)
+        {
+            var isCurrent = s.Id == currentSession.Id ? " (current)" : "";
+            Console.WriteLine(Ansi.GrayText($"  - {s.Id}{isCurrent} | {s.UpdatedAt.ToLocalTime():yyyy-MM-dd HH:mm} | {s.Messages.Count} msgs"));
+        }
+        Console.WriteLine();
+        continue;
+    }
+
     using var turnCts = new CancellationTokenSource();
     currentTurnCts = turnCts;
 
     try
     {
         await renderer.RenderStreamAsync(loop.RunAsync(trimmed, turnCts.Token), turnCts.Token);
+        currentSession.Messages = loop.History.ToList();
+        sessionStore.SaveSession(currentSession);
     }
     catch (OperationCanceledException)
     {

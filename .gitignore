@@ -12,11 +12,13 @@
 *.userosscache
 *.sln.docstates
 
-## Local configuration & Secrets
+## Local configuration, runtime storage & Secrets
 run-ccs.bat
 *.local.bat
 *.env
 *.env.local
+.net-pi/
+dist/
 
 ## Test outputs & archives
 TestResults/

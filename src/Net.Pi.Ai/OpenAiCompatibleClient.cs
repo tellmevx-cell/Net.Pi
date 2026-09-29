@@ -182,6 +182,16 @@ public class OpenAiCompatibleClient : ILlmClient
             return null;
         }
 
+        UsageStats? usage = null;
+        if (rootNode?["usage"] is JsonObject usageObj)
+        {
+            var promptTokens = usageObj["prompt_tokens"]?.GetValue<int>() ?? 0;
+            var completionTokens = usageObj["completion_tokens"]?.GetValue<int>() ?? 0;
+            var totalTokens = usageObj["total_tokens"]?.GetValue<int>() ?? 0;
+            var reasoningTokens = usageObj["completion_tokens_details"]?["reasoning_tokens"]?.GetValue<int>() ?? 0;
+            usage = new UsageStats(promptTokens, completionTokens, reasoningTokens, totalTokens);
+        }
+
         if (rootNode?["choices"] is JsonArray choices && choices.Count > 0)
         {
             var choice = choices[0];
@@ -222,10 +232,14 @@ public class OpenAiCompatibleClient : ILlmClient
                 }
             }
 
-            if (!string.IsNullOrEmpty(text) || !string.IsNullOrEmpty(reasoning) || toolDeltas != null || finishReason != null)
+            if (!string.IsNullOrEmpty(text) || !string.IsNullOrEmpty(reasoning) || toolDeltas != null || finishReason != null || usage != null)
             {
-                return new ChatStreamChunk(text, reasoning, toolDeltas, finishReason);
+                return new ChatStreamChunk(text, reasoning, toolDeltas, finishReason, usage);
             }
+        }
+        else if (usage != null)
+        {
+            return new ChatStreamChunk(Usage: usage);
         }
 
         return null;

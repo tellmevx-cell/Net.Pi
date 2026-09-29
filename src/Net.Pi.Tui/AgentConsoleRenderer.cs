@@ -74,6 +74,16 @@ public class AgentConsoleRenderer
                     _hasWrittenAssistantHeader = false;
                     break;
 
+                case AgentTurnCompleted turnDone:
+                    if (turnDone.Usage != null)
+                    {
+                        var cost = turnDone.Usage.EstimateCostUsd("gemini");
+                        var timeStr = turnDone.Duration.HasValue ? $"{turnDone.Duration.Value.TotalSeconds:F1}s" : "-";
+                        Console.WriteLine();
+                        Console.WriteLine(Ansi.GrayText($"   ⚡ [Turn {turnDone.TurnIndex} finished in {timeStr} | Tokens: {turnDone.Usage.TotalTokens} (p:{turnDone.Usage.PromptTokens}, c:{turnDone.Usage.CompletionTokens}) | est: ~${cost:F5}]"));
+                    }
+                    break;
+
                 case AgentErrorOccurred err:
                     Console.WriteLine();
                     Console.WriteLine(Ansi.RedText($"[ERROR] {err.Message}"));

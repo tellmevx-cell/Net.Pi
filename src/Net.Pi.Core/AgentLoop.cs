@@ -61,6 +61,12 @@ public class AgentLoop
         }
     }
 
+    public void RestoreFromHistory(IEnumerable<ChatMessage> history)
+    {
+        _history.Clear();
+        _history.AddRange(history);
+    }
+
     public async IAsyncEnumerable<AgentEvent> RunAsync(
         string userPrompt,
         [EnumeratorCancellation] CancellationToken ct = default)
@@ -80,6 +86,10 @@ public class AgentLoop
         )).ToList();
 
         int turn = 0;
+        int totalPromptTokens = 0;
+        int totalCompletionTokens = 0;
+        int totalReasoningTokens = 0;
+
         while (!ct.IsCancellationRequested)
         {
             if (turn >= _options.MaxTurns)
@@ -93,6 +103,7 @@ public class AgentLoop
             }
 
             turn++;
+            var turnStopwatch = System.Diagnostics.Stopwatch.StartNew();
             yield return new AgentTurnStarted(turn);
 
             // 1. Context compaction to prevent context window explosion
@@ -100,6 +111,7 @@ public class AgentLoop
 
             var textBuilder = new StringBuilder();
             var toolCallsMap = new Dictionary<int, (string? id, string? name, StringBuilder args)>();
+            UsageStats? turnUsage = null;
 
             IAsyncEnumerator<ChatStreamChunk>? enumerator = null;
             Exception? streamError = null;
@@ -137,6 +149,14 @@ public class AgentLoop
                     if (!hasNext || chunk == null)
                     {
                         break;
+                    }
+
+                    if (chunk.Usage != null)
+                    {
+                        turnUsage = chunk.Usage;
+                        totalPromptTokens += chunk.Usage.PromptTokens;
+                        totalCompletionTokens += chunk.Usage.CompletionTokens;
+                        totalReasoningTokens += chunk.Usage.ReasoningTokens;
                     }
 
                     // Yielding outside try-catch block
@@ -180,16 +200,19 @@ public class AgentLoop
                 }
             }
 
+            turnStopwatch.Stop();
+            var totalUsage = new UsageStats(totalPromptTokens, totalCompletionTokens, totalReasoningTokens, totalPromptTokens + totalCompletionTokens);
+
             if (wasCancelled || ct.IsCancellationRequested)
             {
-                yield return new AgentRunCompleted(turn, AgentRunStatus.Cancelled, "Operation was cancelled by user.");
+                yield return new AgentRunCompleted(turn, AgentRunStatus.Cancelled, "Operation was cancelled by user.", totalUsage);
                 yield break;
             }
 
             if (streamError != null)
             {
                 yield return new AgentErrorOccurred(streamError, $"LLM stream error: {streamError.Message}");
-                yield return new AgentRunCompleted(turn, AgentRunStatus.Error, streamError.Message);
+                yield return new AgentRunCompleted(turn, AgentRunStatus.Error, streamError.Message, totalUsage);
                 yield break;
             }
 
@@ -208,12 +231,12 @@ public class AgentLoop
             );
             _history.Add(assistantMsg);
 
-            yield return new AgentTurnCompleted(turn, assistantContent, completedToolCalls.Count > 0);
+            yield return new AgentTurnCompleted(turn, assistantContent, completedToolCalls.Count > 0, turnUsage, turnStopwatch.Elapsed);
 
             // If no tools were called, this task completed normally
             if (completedToolCalls.Count == 0)
             {
-                yield return new AgentRunCompleted(turn, AgentRunStatus.Completed);
+                yield return new AgentRunCompleted(turn, AgentRunStatus.Completed, TotalUsage: totalUsage);
                 yield break;
             }
 

@@ -2,6 +2,23 @@ using System.Text.Json.Serialization;
 
 namespace Net.Pi.Ai.Models;
 
+public record UsageStats(
+    int PromptTokens = 0,
+    int CompletionTokens = 0,
+    int ReasoningTokens = 0,
+    int TotalTokens = 0
+)
+{
+    public double EstimateCostUsd(string model)
+    {
+        // General blended price approximations per 1M tokens
+        double promptRate = model.Contains("gemini", StringComparison.OrdinalIgnoreCase) ? 0.15 : 0.50;
+        double completionRate = model.Contains("gemini", StringComparison.OrdinalIgnoreCase) ? 0.60 : 1.50;
+
+        return (PromptTokens * promptRate + CompletionTokens * completionRate) / 1_000_000.0;
+    }
+}
+
 public record ToolCall(
     [property: JsonPropertyName("id")] string Id,
     [property: JsonPropertyName("name")] string Name,
@@ -48,11 +65,13 @@ public record ChatStreamChunk(
     string? DeltaText = null,
     string? ReasoningDelta = null,
     IReadOnlyList<ToolCallDelta>? ToolDeltas = null,
-    string? FinishReason = null
+    string? FinishReason = null,
+    UsageStats? Usage = null
 );
 
 public record ChatCompletionResult(
     string Content,
     IReadOnlyList<ToolCall> ToolCalls,
-    string? FinishReason = null
+    string? FinishReason = null,
+    UsageStats? Usage = null
 );

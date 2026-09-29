@@ -9,12 +9,13 @@ namespace Net.Pi.Tools;
 public class ExecuteCommandTool : ITool
 {
     private readonly string _workingDirectory;
+    private readonly Func<string, Task<bool>>? _confirmationGate;
     private readonly TimeSpan _defaultTimeout = TimeSpan.FromMinutes(2);
     private const int MaxOutputLines = 2000;
     private const int MaxOutputChars = 512 * 1024; // 512 KB
 
     public string Name => "execute_command";
-    public string Description => "Executes a shell command on the host system (cmd on Windows with UTF-8, bash on Unix) with timeout, cancellation, and output buffer protection.";
+    public string Description => "Executes a shell command on the host system (cmd on Windows with UTF-8, bash on Unix) with timeout, cancellation, permission gate, and output buffer protection.";
 
     public object ParametersSchema => new
     {
@@ -27,9 +28,10 @@ public class ExecuteCommandTool : ITool
         required = new[] { "command" }
     };
 
-    public ExecuteCommandTool(string? workingDirectory = null)
+    public ExecuteCommandTool(string? workingDirectory = null, Func<string, Task<bool>>? confirmationGate = null)
     {
         _workingDirectory = workingDirectory ?? Directory.GetCurrentDirectory();
+        _confirmationGate = confirmationGate;
     }
 
     public async Task<ToolResult> ExecuteAsync(string argumentsJson, CancellationToken ct = default)
@@ -43,6 +45,16 @@ public class ExecuteCommandTool : ITool
             if (string.IsNullOrWhiteSpace(command))
             {
                 return ToolResult.Error("Missing required parameter: 'command'.");
+            }
+
+            // Interactive confirmation gate check if configured
+            if (_confirmationGate != null)
+            {
+                var allowed = await _confirmationGate(command).ConfigureAwait(false);
+                if (!allowed)
+                {
+                    return ToolResult.Error($"Command execution denied by user permission gate: '{command}'.");
+                }
             }
 
             var isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
