@@ -1,0 +1,10 @@
+@echo off
+:: Replace with your own endpoint and API key
+set OPENAI_API_KEY=your-api-key-here
+set OPENAI_BASE_URL=http://10.16.10.122:8045/v1
+set OPENAI_MODEL=gemini-3.7-flash
+
+echo [Net.Pi] Target Model: %OPENAI_MODEL%
+echo [Net.Pi] Base URL:     %OPENAI_BASE_URL%
+
+dotnet run --project src/Net.Pi.Cli/Net.Pi.Cli.csproj -- %*

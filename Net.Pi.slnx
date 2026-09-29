@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Net.Pi.Ai/Net.Pi.Ai.csproj" />
+    <Project Path="src/Net.Pi.Cli/Net.Pi.Cli.csproj" />
+    <Project Path="src/Net.Pi.Core/Net.Pi.Core.csproj" />
+    <Project Path="src/Net.Pi.Tools/Net.Pi.Tools.csproj" />
+    <Project Path="src/Net.Pi.Tui/Net.Pi.Tui.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Net.Pi.Tests/Net.Pi.Tests.csproj" />
+  </Folder>
+</Solution>

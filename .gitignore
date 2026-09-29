@@ -1,0 +1,25 @@
+## .NET build artifacts
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+## Visual Studio / Rider / IDE
+.vs/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## Local configuration & Secrets
+run-ccs.bat
+*.local.bat
+*.env
+*.env.local
+
+## Test outputs & archives
+TestResults/
+*.zip
+*.7z
+*.png
