@@ -10,9 +10,11 @@ public class ExecuteCommandTool : ITool
 {
     private readonly string _workingDirectory;
     private readonly TimeSpan _defaultTimeout = TimeSpan.FromMinutes(2);
+    private const int MaxOutputLines = 2000;
+    private const int MaxOutputChars = 512 * 1024; // 512 KB
 
     public string Name => "execute_command";
-    public string Description => "Executes a shell command on the host system (cmd/powershell on Windows, bash/sh on Unix) and captures stdout and stderr.";
+    public string Description => "Executes a shell command on the host system (cmd on Windows with UTF-8, bash on Unix) with timeout, cancellation, and output buffer protection.";
 
     public object ParametersSchema => new
     {
@@ -45,7 +47,8 @@ public class ExecuteCommandTool : ITool
 
             var isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
             var fileName = isWindows ? "cmd.exe" : "/bin/bash";
-            var args = isWindows ? $"/c \"{command}\"" : $"-c \"{command.Replace("\"", "\\\"")}\"";
+            // Prepend chcp 65001 on Windows cmd to guarantee UTF-8 console output
+            var args = isWindows ? $"/c \"chcp 65001 >nul && {command}\"" : $"-c \"{command.Replace("\"", "\\\"")}\"";
 
             var psi = new ProcessStartInfo
             {
@@ -63,9 +66,40 @@ public class ExecuteCommandTool : ITool
             using var process = new Process { StartInfo = psi };
             var stdout = new StringBuilder();
             var stderr = new StringBuilder();
+            int stdoutLineCount = 0;
+            int stderrLineCount = 0;
+            bool stdoutTruncated = false;
+            bool stderrTruncated = false;
 
-            process.OutputDataReceived += (_, e) => { if (e.Data != null) stdout.AppendLine(e.Data); };
-            process.ErrorDataReceived += (_, e) => { if (e.Data != null) stderr.AppendLine(e.Data); };
+            process.OutputDataReceived += (_, e) =>
+            {
+                if (e.Data == null) return;
+                if (stdoutLineCount < MaxOutputLines && stdout.Length < MaxOutputChars)
+                {
+                    stdout.AppendLine(e.Data);
+                    stdoutLineCount++;
+                }
+                else if (!stdoutTruncated)
+                {
+                    stdout.AppendLine($"... [Output truncated after {MaxOutputLines} lines / {MaxOutputChars / 1024} KB limit]");
+                    stdoutTruncated = true;
+                }
+            };
+
+            process.ErrorDataReceived += (_, e) =>
+            {
+                if (e.Data == null) return;
+                if (stderrLineCount < MaxOutputLines && stderr.Length < MaxOutputChars)
+                {
+                    stderr.AppendLine(e.Data);
+                    stderrLineCount++;
+                }
+                else if (!stderrTruncated)
+                {
+                    stderr.AppendLine($"... [Error output truncated after {MaxOutputLines} lines]");
+                    stderrTruncated = true;
+                }
+            };
 
             process.Start();
             process.BeginOutputReadLine();

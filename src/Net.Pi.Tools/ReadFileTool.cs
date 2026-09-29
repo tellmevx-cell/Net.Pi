@@ -40,7 +40,9 @@ public class ReadFileTool : ITool
                 return ToolResult.Error("Missing required parameter: 'path'.");
             }
 
-            var fullPath = Path.IsPathRooted(path) ? path : Path.Combine(_workspaceRoot, path);
+            var (isAllowed, fullPath, errMsg) = PathGuard.ResolveAndValidate(_workspaceRoot, path);
+            if (!isAllowed) return ToolResult.Error(errMsg!);
+
             if (!File.Exists(fullPath))
             {
                 return ToolResult.Error($"File not found: {path}");

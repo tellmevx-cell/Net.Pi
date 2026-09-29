@@ -43,7 +43,9 @@ public class WriteFileTool : ITool
                 return ToolResult.Error("Missing required parameter: 'content'.");
             }
 
-            var fullPath = Path.IsPathRooted(path) ? path : Path.Combine(_workspaceRoot, path);
+            var (isAllowed, fullPath, errMsg) = PathGuard.ResolveAndValidate(_workspaceRoot, path);
+            if (!isAllowed) return ToolResult.Error(errMsg!);
+
             var dir = Path.GetDirectoryName(fullPath);
             if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
             {

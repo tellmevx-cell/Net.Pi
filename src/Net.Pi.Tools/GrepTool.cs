@@ -10,9 +10,10 @@ namespace Net.Pi.Tools;
 public class GrepTool : ITool
 {
     private readonly string _workspaceRoot;
+    private static readonly TimeSpan RegexTimeout = TimeSpan.FromSeconds(5);
 
     public string Name => "grep";
-    public string Description => "Search file contents using regular expressions. Skips binary files and build/cache directories (.git, bin, obj, node_modules).";
+    public string Description => "Search file contents using regular expressions. Skips binary files and build/cache directories (.git, bin, obj, node_modules). Protected against ReDoS timeouts.";
 
     public object ParametersSchema => new
     {
@@ -55,16 +56,18 @@ public class GrepTool : ITool
             var globPattern = node?["glob"]?.GetValue<string>() ?? "**/*";
             var caseSensitive = node?["case_sensitive"]?.GetValue<bool>() ?? false;
             var outputMode = node?["output_mode"]?.GetValue<string>() ?? "content";
-            var maxResults = node?["max_results"]?.GetValue<int>() ?? 100;
+            var maxResults = Math.Clamp(node?["max_results"]?.GetValue<int>() ?? 100, 1, 1000);
 
             if (string.IsNullOrWhiteSpace(pattern))
             {
                 return ToolResult.Error("Missing required parameter: 'pattern'.");
             }
 
-            var baseDir = string.IsNullOrWhiteSpace(path)
-                ? _workspaceRoot
-                : (Path.IsPathRooted(path) ? path : Path.Combine(_workspaceRoot, path));
+            var (isAllowed, baseDir, errMsg) = string.IsNullOrWhiteSpace(path)
+                ? (true, _workspaceRoot, null)
+                : PathGuard.ResolveAndValidate(_workspaceRoot, path);
+
+            if (!isAllowed) return ToolResult.Error(errMsg!);
 
             // If path points directly to a single file
             if (File.Exists(baseDir))
@@ -89,7 +92,16 @@ public class GrepTool : ITool
 
             var regexOptions = RegexOptions.Compiled;
             if (!caseSensitive) regexOptions |= RegexOptions.IgnoreCase;
-            var regex = new Regex(pattern, regexOptions);
+
+            Regex regex;
+            try
+            {
+                regex = new Regex(pattern, regexOptions, RegexTimeout);
+            }
+            catch (ArgumentException ex)
+            {
+                return ToolResult.Error($"Invalid regular expression '{pattern}': {ex.Message}");
+            }
 
             var sb = new StringBuilder();
             int totalMatches = 0;
@@ -107,18 +119,25 @@ public class GrepTool : ITool
 
                 for (int i = 0; i < lines.Length; i++)
                 {
-                    if (regex.IsMatch(lines[i]))
+                    try
                     {
-                        fileHasMatch = true;
-                        totalMatches++;
-
-                        if (outputMode == "content")
+                        if (regex.IsMatch(lines[i]))
                         {
-                            var relPath = fileResult.Path.Replace('\\', '/');
-                            sb.AppendLine($"{relPath}:{i + 1}: {lines[i]}");
-                        }
+                            fileHasMatch = true;
+                            totalMatches++;
 
-                        if (totalMatches >= maxResults) break;
+                            if (outputMode == "content")
+                            {
+                                var relPath = fileResult.Path.Replace('\\', '/');
+                                sb.AppendLine($"{relPath}:{i + 1}: {lines[i]}");
+                            }
+
+                            if (totalMatches >= maxResults) break;
+                        }
+                    }
+                    catch (RegexMatchTimeoutException)
+                    {
+                        return ToolResult.Error($"Regex evaluation timed out after {RegexTimeout.TotalSeconds} seconds for pattern '{pattern}' (ReDoS protection).");
                     }
                 }
 
@@ -160,7 +179,16 @@ public class GrepTool : ITool
     {
         var regexOptions = RegexOptions.Compiled;
         if (!caseSensitive) regexOptions |= RegexOptions.IgnoreCase;
-        var regex = new Regex(pattern, regexOptions);
+
+        Regex regex;
+        try
+        {
+            regex = new Regex(pattern, regexOptions, RegexTimeout);
+        }
+        catch (ArgumentException ex)
+        {
+            return ToolResult.Error($"Invalid regular expression '{pattern}': {ex.Message}");
+        }
 
         var lines = await File.ReadAllLinesAsync(filePath, ct).ConfigureAwait(false);
         var sb = new StringBuilder();
@@ -168,11 +196,18 @@ public class GrepTool : ITool
 
         for (int i = 0; i < lines.Length; i++)
         {
-            if (regex.IsMatch(lines[i]))
+            try
             {
-                matches++;
-                sb.AppendLine($"{Path.GetFileName(filePath)}:{i + 1}: {lines[i]}");
-                if (matches >= maxResults) break;
+                if (regex.IsMatch(lines[i]))
+                {
+                    matches++;
+                    sb.AppendLine($"{Path.GetFileName(filePath)}:{i + 1}: {lines[i]}");
+                    if (matches >= maxResults) break;
+                }
+            }
+            catch (RegexMatchTimeoutException)
+            {
+                return ToolResult.Error($"Regex evaluation timed out after {RegexTimeout.TotalSeconds} seconds (ReDoS protection).");
             }
         }
 

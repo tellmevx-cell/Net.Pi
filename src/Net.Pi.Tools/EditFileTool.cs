@@ -39,10 +39,12 @@ public class EditFileTool : ITool
             var replaceAll = node?["replace_all"]?.GetValue<bool>() ?? false;
 
             if (string.IsNullOrWhiteSpace(path)) return ToolResult.Error("Missing 'path'.");
-            if (oldString == null) return ToolResult.Error("Missing 'old_string'.");
+            if (string.IsNullOrEmpty(oldString)) return ToolResult.Error("Parameter 'old_string' cannot be null or empty.");
             if (newString == null) return ToolResult.Error("Missing 'new_string'.");
 
-            var fullPath = Path.IsPathRooted(path) ? path : Path.Combine(_workspaceRoot, path);
+            var (isAllowed, fullPath, errMsg) = PathGuard.ResolveAndValidate(_workspaceRoot, path);
+            if (!isAllowed) return ToolResult.Error(errMsg!);
+
             if (!File.Exists(fullPath)) return ToolResult.Error($"File not found: {path}");
 
             var content = await File.ReadAllTextAsync(fullPath, ct).ConfigureAwait(false);

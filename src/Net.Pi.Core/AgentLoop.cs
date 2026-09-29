@@ -11,6 +11,7 @@ public class AgentLoopOptions
     public int MaxTurns { get; set; } = 30;
     public string? SystemPrompt { get; set; }
     public ChatCompletionOptions? ChatOptions { get; set; }
+    public ContextCompactorOptions? CompactorOptions { get; set; }
 }
 
 public class AgentLoop
@@ -19,6 +20,7 @@ public class AgentLoop
     private readonly Dictionary<string, ITool> _tools = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<ChatMessage> _history = new();
     private readonly AgentLoopOptions _options;
+    private readonly ContextCompactor _compactor;
 
     public IReadOnlyList<ChatMessage> History => _history;
     public IReadOnlyDictionary<string, ITool> Tools => _tools;
@@ -27,6 +29,7 @@ public class AgentLoop
     {
         _llmClient = llmClient ?? throw new ArgumentNullException(nameof(llmClient));
         _options = options ?? new AgentLoopOptions();
+        _compactor = new ContextCompactor(_options.CompactorOptions);
 
         if (tools != null)
         {
@@ -36,10 +39,7 @@ public class AgentLoop
             }
         }
 
-        if (!string.IsNullOrWhiteSpace(_options.SystemPrompt))
-        {
-            _history.Add(ChatMessage.System(_options.SystemPrompt));
-        }
+        ResetHistory();
     }
 
     public void RegisterTool(ITool tool)
@@ -52,10 +52,25 @@ public class AgentLoop
         _history.Add(message);
     }
 
+    public void ResetHistory()
+    {
+        _history.Clear();
+        if (!string.IsNullOrWhiteSpace(_options.SystemPrompt))
+        {
+            _history.Add(ChatMessage.System(_options.SystemPrompt));
+        }
+    }
+
     public async IAsyncEnumerable<AgentEvent> RunAsync(
         string userPrompt,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
+        if (ct.IsCancellationRequested)
+        {
+            yield return new AgentRunCompleted(0, AgentRunStatus.Cancelled, "Run cancelled before start.");
+            yield break;
+        }
+
         _history.Add(ChatMessage.User(userPrompt));
 
         var toolDefs = _tools.Values.Select(t => new ToolDefinition(
@@ -65,59 +80,117 @@ public class AgentLoop
         )).ToList();
 
         int turn = 0;
-        while (turn < _options.MaxTurns && !ct.IsCancellationRequested)
+        while (!ct.IsCancellationRequested)
         {
+            if (turn >= _options.MaxTurns)
+            {
+                yield return new AgentRunCompleted(
+                    turn, 
+                    AgentRunStatus.MaxTurnsReached, 
+                    $"Reached maximum turns limit of {_options.MaxTurns}."
+                );
+                yield break;
+            }
+
             turn++;
             yield return new AgentTurnStarted(turn);
+
+            // 1. Context compaction to prevent context window explosion
+            _compactor.CompactIfNeeded(_history);
 
             var textBuilder = new StringBuilder();
             var toolCallsMap = new Dictionary<int, (string? id, string? name, StringBuilder args)>();
 
-            IAsyncEnumerable<ChatStreamChunk>? stream = null;
+            IAsyncEnumerator<ChatStreamChunk>? enumerator = null;
             Exception? streamError = null;
+            bool wasCancelled = false;
+
             try
             {
-                stream = _llmClient.StreamChatAsync(_history, toolDefs, _options.ChatOptions, ct);
+                var stream = _llmClient.StreamChatAsync(_history, toolDefs, _options.ChatOptions, ct);
+                enumerator = stream.GetAsyncEnumerator(ct);
+
+                while (!ct.IsCancellationRequested)
+                {
+                    bool hasNext = false;
+                    ChatStreamChunk? chunk = null;
+
+                    try
+                    {
+                        hasNext = await enumerator.MoveNextAsync().ConfigureAwait(false);
+                        if (hasNext)
+                        {
+                            chunk = enumerator.Current;
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        wasCancelled = true;
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        streamError = ex;
+                        break;
+                    }
+
+                    if (!hasNext || chunk == null)
+                    {
+                        break;
+                    }
+
+                    // Yielding outside try-catch block
+                    if (!string.IsNullOrEmpty(chunk.ReasoningDelta))
+                    {
+                        yield return new AgentReasoningDelta(chunk.ReasoningDelta);
+                    }
+
+                    if (!string.IsNullOrEmpty(chunk.DeltaText))
+                    {
+                        textBuilder.Append(chunk.DeltaText);
+                        yield return new AgentTextDelta(chunk.DeltaText);
+                    }
+
+                    if (chunk.ToolDeltas != null)
+                    {
+                        foreach (var d in chunk.ToolDeltas)
+                        {
+                            if (!toolCallsMap.TryGetValue(d.Index, out var current))
+                            {
+                                current = (d.Id, d.Name, new StringBuilder());
+                                toolCallsMap[d.Index] = current;
+                            }
+                            if (!string.IsNullOrEmpty(d.Id)) current.id = d.Id;
+                            if (!string.IsNullOrEmpty(d.Name)) current.name = d.Name;
+                            if (!string.IsNullOrEmpty(d.ArgumentsDelta)) current.args.Append(d.ArgumentsDelta);
+                            toolCallsMap[d.Index] = current;
+                        }
+                    }
+                }
             }
-            catch (Exception ex)
+            finally
             {
-                streamError = ex;
+                if (enumerator != null)
+                {
+                    try
+                    {
+                        await enumerator.DisposeAsync().ConfigureAwait(false);
+                    }
+                    catch { }
+                }
+            }
+
+            if (wasCancelled || ct.IsCancellationRequested)
+            {
+                yield return new AgentRunCompleted(turn, AgentRunStatus.Cancelled, "Operation was cancelled by user.");
+                yield break;
             }
 
             if (streamError != null)
             {
                 yield return new AgentErrorOccurred(streamError, $"LLM stream error: {streamError.Message}");
+                yield return new AgentRunCompleted(turn, AgentRunStatus.Error, streamError.Message);
                 yield break;
-            }
-
-            await foreach (var chunk in stream!.WithCancellation(ct).ConfigureAwait(false))
-            {
-                if (!string.IsNullOrEmpty(chunk.ReasoningDelta))
-                {
-                    yield return new AgentReasoningDelta(chunk.ReasoningDelta);
-                }
-
-                if (!string.IsNullOrEmpty(chunk.DeltaText))
-                {
-                    textBuilder.Append(chunk.DeltaText);
-                    yield return new AgentTextDelta(chunk.DeltaText);
-                }
-
-                if (chunk.ToolDeltas != null)
-                {
-                    foreach (var d in chunk.ToolDeltas)
-                    {
-                        if (!toolCallsMap.TryGetValue(d.Index, out var current))
-                        {
-                            current = (d.Id, d.Name, new StringBuilder());
-                            toolCallsMap[d.Index] = current;
-                        }
-                        if (!string.IsNullOrEmpty(d.Id)) current.id = d.Id;
-                        if (!string.IsNullOrEmpty(d.Name)) current.name = d.Name;
-                        if (!string.IsNullOrEmpty(d.ArgumentsDelta)) current.args.Append(d.ArgumentsDelta);
-                        toolCallsMap[d.Index] = current;
-                    }
-                }
             }
 
             var completedToolCalls = toolCallsMap.Values
@@ -137,28 +210,52 @@ public class AgentLoop
 
             yield return new AgentTurnCompleted(turn, assistantContent, completedToolCalls.Count > 0);
 
-            // If no tools were called, this task is complete
+            // If no tools were called, this task completed normally
             if (completedToolCalls.Count == 0)
             {
-                yield return new AgentRunCompleted(turn);
+                yield return new AgentRunCompleted(turn, AgentRunStatus.Completed);
                 yield break;
             }
 
-            // Execute tools sequentially or concurrently (here deterministic sequential per tool call)
+            // Check if this was the last allowed turn before executing tools
+            if (turn >= _options.MaxTurns)
+            {
+                yield return new AgentRunCompleted(
+                    turn,
+                    AgentRunStatus.MaxTurnsReached,
+                    $"Reached maximum turns limit ({_options.MaxTurns}) with pending tool calls."
+                );
+                yield break;
+            }
+
+            // Execute tools sequentially with individual try-catch guards
             foreach (var call in completedToolCalls)
             {
+                if (ct.IsCancellationRequested)
+                {
+                    yield return new AgentRunCompleted(turn, AgentRunStatus.Cancelled, "Cancelled during tool execution.");
+                    yield break;
+                }
+
                 yield return new ToolCallStarting(call.Id, call.Name, call.Arguments);
 
                 ToolResult result;
+                bool toolCancelled = false;
+
                 if (_tools.TryGetValue(call.Name, out var toolInstance))
                 {
                     try
                     {
                         result = await toolInstance.ExecuteAsync(call.Arguments, ct).ConfigureAwait(false);
                     }
+                    catch (OperationCanceledException)
+                    {
+                        toolCancelled = true;
+                        result = ToolResult.Error("Tool execution was cancelled.");
+                    }
                     catch (Exception ex)
                     {
-                        result = ToolResult.Error($"Error executing tool {call.Name}: {ex.Message}");
+                        result = ToolResult.Error($"Unhandled exception in tool '{call.Name}': {ex.Message}");
                     }
                 }
                 else
@@ -166,11 +263,17 @@ public class AgentLoop
                     result = ToolResult.Error($"Unknown tool '{call.Name}'.");
                 }
 
+                if (toolCancelled)
+                {
+                    yield return new AgentRunCompleted(turn, AgentRunStatus.Cancelled, "Tool execution was cancelled.");
+                    yield break;
+                }
+
                 _history.Add(ChatMessage.ToolResult(call.Id, result.Content, call.Name));
                 yield return new ToolCallCompleted(call.Id, call.Name, result);
             }
         }
 
-        yield return new AgentRunCompleted(turn);
+        yield return new AgentRunCompleted(turn, AgentRunStatus.Completed);
     }
 }

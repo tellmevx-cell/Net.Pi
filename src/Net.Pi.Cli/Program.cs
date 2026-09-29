@@ -76,7 +76,7 @@ if (skillManager.Skills.Count > 0)
     Console.WriteLine(Ansi.GreenText($"✓ Loaded {skillManager.Skills.Count} skill(s): {string.Join(", ", skillManager.Skills.Select(s => s.Name))}\n"));
 }
 
-// 2. Register all tools
+// 2. Register all tools with workspace boundaries
 var tools = new ITool[]
 {
     new ReadFileTool(currentDir),
@@ -101,16 +101,16 @@ Conventions:
 - Be concise. Keep prose brief.
 - Use your tools to inspect code and solve tasks directly:
   * glob: Find files by pattern (e.g. '**/*.cs')
-  * grep: Search file contents by regex or keywords
+  * grep: Search file contents by regex or keywords (ReDoS-protected)
   * read_file: Read file lines with line numbers
-  * write_file: Write or overwrite files
+  * write_file: Write or overwrite files (guarded against workspace escape)
   * edit_file: Exact string replacement
   * list_dir: List directory entries
   * web_search: Search web pages (Bing / keywords)
   * web_fetch: Fetch and parse web page markdown/text
   * agent_browser: Headless browser automation (navigate/screenshot)
   * read_skill: Read full instructions for an available skill
-  * execute_command: Run terminal commands
+  * execute_command: Run terminal commands (UTF-8 encoded)
 - Verify work when feasible.
 {skillManager.BuildCatalogPrompt()}
 """;
@@ -123,17 +123,38 @@ var loop = new AgentLoop(llmClient, tools, new AgentLoopOptions
 
 var renderer = new AgentConsoleRenderer();
 
+// Setup Ctrl+C cancellation handler
+CancellationTokenSource? currentTurnCts = null;
+Console.CancelKeyPress += (s, e) =>
+{
+    if (currentTurnCts != null && !currentTurnCts.IsCancellationRequested)
+    {
+        e.Cancel = true; // Keep process alive, cancel turn only
+        currentTurnCts.Cancel();
+        Console.WriteLine(Ansi.YellowText("\n[Ctrl+C received: cancelling active turn...]"));
+    }
+};
+
 // Single prompt execution mode if command-line args provided
 var promptArg = args.FirstOrDefault(a => !a.StartsWith("--"));
 if (!string.IsNullOrWhiteSpace(promptArg))
 {
+    using var singleCts = new CancellationTokenSource();
+    currentTurnCts = singleCts;
     Console.WriteLine(Ansi.BoldText($"User > {promptArg}"));
-    await renderer.RenderStreamAsync(loop.RunAsync(promptArg));
+    try
+    {
+        await renderer.RenderStreamAsync(loop.RunAsync(promptArg, singleCts.Token), singleCts.Token);
+    }
+    finally
+    {
+        currentTurnCts = null;
+    }
     return;
 }
 
 // Interactive REPL Mode
-Console.WriteLine(Ansi.Color("Entering interactive session. Type 'exit' to quit, 'clear' to clear history.\n", Ansi.Gray));
+Console.WriteLine(Ansi.Color("Commands: /clear (clear screen), /reset (clear session history), /history (token stats), exit\n", Ansi.Gray));
 
 while (true)
 {
@@ -143,25 +164,51 @@ while (true)
 
     var trimmed = input.Trim();
     if (trimmed.Equals("exit", StringComparison.OrdinalIgnoreCase) || 
+        trimmed.Equals("/exit", StringComparison.OrdinalIgnoreCase) ||
         trimmed.Equals("quit", StringComparison.OrdinalIgnoreCase))
     {
         Console.WriteLine(Ansi.GrayText("Goodbye!"));
         break;
     }
 
-    if (trimmed.Equals("clear", StringComparison.OrdinalIgnoreCase))
+    if (trimmed.Equals("/clear", StringComparison.OrdinalIgnoreCase) || trimmed.Equals("clear", StringComparison.OrdinalIgnoreCase))
     {
         Console.Clear();
-        Console.WriteLine(Ansi.YellowText("Session cleared.\n"));
         continue;
     }
 
+    if (trimmed.Equals("/reset", StringComparison.OrdinalIgnoreCase) || trimmed.Equals("reset", StringComparison.OrdinalIgnoreCase))
+    {
+        loop.ResetHistory();
+        Console.Clear();
+        Console.WriteLine(Ansi.YellowText("✓ Session history reset. Fresh conversation started.\n"));
+        continue;
+    }
+
+    if (trimmed.Equals("/history", StringComparison.OrdinalIgnoreCase))
+    {
+        var tokens = ContextCompactor.EstimateTokens(loop.History);
+        Console.WriteLine(Ansi.GrayText($"Session history: {loop.History.Count} message(s), ~{tokens} estimated tokens.\n"));
+        continue;
+    }
+
+    using var turnCts = new CancellationTokenSource();
+    currentTurnCts = turnCts;
+
     try
     {
-        await renderer.RenderStreamAsync(loop.RunAsync(trimmed));
+        await renderer.RenderStreamAsync(loop.RunAsync(trimmed, turnCts.Token), turnCts.Token);
+    }
+    catch (OperationCanceledException)
+    {
+        Console.WriteLine(Ansi.YellowText("\n[Turn cancelled by user]\n"));
     }
     catch (Exception ex)
     {
         Console.WriteLine(Ansi.RedText($"[Fatal Error] {ex.Message}"));
+    }
+    finally
+    {
+        currentTurnCts = null;
     }
 }

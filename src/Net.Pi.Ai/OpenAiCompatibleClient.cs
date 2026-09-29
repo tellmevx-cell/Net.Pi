@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -13,6 +14,8 @@ public class OpenAiCompatibleClient : ILlmClient
     private readonly string _apiKey;
     private readonly string _baseUrl;
     private readonly string _defaultModel;
+    private readonly int _maxRetries = 3;
+    private readonly TimeSpan _readInactivityTimeout = TimeSpan.FromSeconds(60);
 
     public string DefaultModel => _defaultModel;
 
@@ -32,76 +35,200 @@ public class OpenAiCompatibleClient : ILlmClient
     {
         var model = options?.Model ?? _defaultModel;
         var requestPayload = BuildRequestBody(messages, tools, options, model, stream: true);
+        var jsonContent = requestPayload.ToJsonString();
 
-        using var request = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/chat/completions");
-        if (!string.IsNullOrWhiteSpace(_apiKey))
+        HttpResponseMessage? response = null;
+        for (int attempt = 0; attempt <= _maxRetries; attempt++)
         {
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
-        }
-        request.Content = new StringContent(requestPayload.ToJsonString(), Encoding.UTF8, "application/json");
+            ct.ThrowIfCancellationRequested();
 
-        using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode)
-        {
-            var err = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-            throw new HttpRequestException($"API request failed with code {response.StatusCode}: {err}");
-        }
-
-        using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-        using var reader = new StreamReader(stream);
-
-        string? line;
-        while (!ct.IsCancellationRequested && (line = await reader.ReadLineAsync(ct).ConfigureAwait(false)) != null)
-        {
-            if (string.IsNullOrWhiteSpace(line)) continue;
-            if (!line.StartsWith("data:")) continue;
-
-            var data = line["data:".Length..].Trim();
-            if (data == "[DONE]")
+            using var request = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/chat/completions");
+            if (!string.IsNullOrWhiteSpace(_apiKey))
             {
-                yield return new ChatStreamChunk(FinishReason: "stop");
-                break;
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
             }
+            request.Content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
 
-            JsonNode? rootNode;
             try
             {
-                rootNode = JsonNode.Parse(data);
-            }
-            catch
-            {
-                continue;
-            }
+                response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
 
-            if (rootNode?["choices"] is JsonArray choices && choices.Count > 0)
-            {
-                var choice = choices[0];
-                var delta = choice?["delta"];
-                var finishReason = choice?["finish_reason"]?.GetValue<string?>();
-                string? text = delta?["content"]?.GetValue<string?>();
-                string? reasoning = delta?["reasoning_content"]?.GetValue<string?>();
-
-                List<ToolCallDelta>? toolDeltas = null;
-                if (delta?["tool_calls"] is JsonArray toolCallsJson)
+                if (response.IsSuccessStatusCode)
                 {
-                    toolDeltas = new List<ToolCallDelta>();
-                    foreach (var tc in toolCallsJson)
+                    break;
+                }
+
+                var statusCode = (int)response.StatusCode;
+                var isTransient = statusCode == 429 || (statusCode >= 500 && statusCode < 600);
+                if (isTransient && attempt < _maxRetries)
+                {
+                    response.Dispose();
+                    response = null;
+                    var delay = TimeSpan.FromMilliseconds(500 * Math.Pow(2, attempt) + Random.Shared.Next(100, 300));
+                    await Task.Delay(delay, ct).ConfigureAwait(false);
+                    continue;
+                }
+
+                var err = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                throw new HttpRequestException($"API request failed with code {response.StatusCode}: {err}", null, response.StatusCode);
+            }
+            catch (HttpRequestException) when (attempt < _maxRetries)
+            {
+                response?.Dispose();
+                response = null;
+                var delay = TimeSpan.FromMilliseconds(500 * Math.Pow(2, attempt) + Random.Shared.Next(100, 300));
+                await Task.Delay(delay, ct).ConfigureAwait(false);
+            }
+        }
+
+        if (response == null || !response.IsSuccessStatusCode)
+        {
+            throw new HttpRequestException("Failed to establish stream connection with LLM provider after retries.");
+        }
+
+        using (response)
+        using (var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false))
+        using (var reader = new StreamReader(stream, Encoding.UTF8))
+        {
+            var dataBuffer = new StringBuilder();
+            string? lastObservedFinishReason = null;
+
+            while (!ct.IsCancellationRequested)
+            {
+                string? line;
+                using (var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                {
+                    readCts.CancelAfter(_readInactivityTimeout);
+                    try
                     {
-                        var index = tc?["index"]?.GetValue<int>() ?? 0;
-                        var id = tc?["id"]?.GetValue<string?>();
-                        var fn = tc?["function"];
-                        var fnName = fn?["name"]?.GetValue<string?>();
-                        var fnArgs = fn?["arguments"]?.GetValue<string?>();
-                        toolDeltas.Add(new ToolCallDelta(index, id, fnName, fnArgs));
+                        line = await reader.ReadLineAsync(readCts.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                    {
+                        throw new TimeoutException($"Stream read timed out after {_readInactivityTimeout.TotalSeconds} seconds of inactivity.");
                     }
                 }
 
-                if (!string.IsNullOrEmpty(text) || !string.IsNullOrEmpty(reasoning) || toolDeltas != null || finishReason != null)
+                if (line == null) // End of stream
                 {
-                    yield return new ChatStreamChunk(text, reasoning, toolDeltas, finishReason);
+                    break;
+                }
+
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    // Empty line dispatches the accumulated SSE event
+                    if (dataBuffer.Length > 0)
+                    {
+                        var data = dataBuffer.ToString().Trim();
+                        dataBuffer.Clear();
+
+                        if (data == "[DONE]")
+                        {
+                            // Do not unconditionally overwrite finish_reason if one was already emitted
+                            if (lastObservedFinishReason == null)
+                            {
+                                yield return new ChatStreamChunk(FinishReason: "stop");
+                            }
+                            break;
+                        }
+
+                        var chunk = ParseSseDataPayload(data, ref lastObservedFinishReason);
+                        if (chunk != null)
+                        {
+                            yield return chunk;
+                        }
+                    }
+                    continue;
+                }
+
+                if (line.StartsWith(':')) // SSE comment (ping / keep-alive)
+                {
+                    continue;
+                }
+
+                if (line.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+                {
+                    var content = line["data:".Length..].TrimStart();
+                    dataBuffer.AppendLine(content);
+                }
+            }
+
+            // Flush any remaining data at end of stream
+            if (dataBuffer.Length > 0)
+            {
+                var data = dataBuffer.ToString().Trim();
+                if (data != "[DONE]")
+                {
+                    var chunk = ParseSseDataPayload(data, ref lastObservedFinishReason);
+                    if (chunk != null)
+                    {
+                        yield return chunk;
+                    }
                 }
             }
         }
+    }
+
+    private static ChatStreamChunk? ParseSseDataPayload(string data, ref string? lastObservedFinishReason)
+    {
+        JsonNode? rootNode;
+        try
+        {
+            rootNode = JsonNode.Parse(data);
+        }
+        catch (JsonException)
+        {
+            // Invalid JSON chunk in stream
+            return null;
+        }
+
+        if (rootNode?["choices"] is JsonArray choices && choices.Count > 0)
+        {
+            var choice = choices[0];
+            var delta = choice?["delta"];
+            var finishReason = choice?["finish_reason"]?.GetValue<string?>();
+            if (!string.IsNullOrEmpty(finishReason))
+            {
+                lastObservedFinishReason = finishReason;
+            }
+
+            string? text = delta?["content"]?.GetValue<string?>();
+            string? reasoning = delta?["reasoning_content"]?.GetValue<string?>();
+
+            List<ToolCallDelta>? toolDeltas = null;
+            if (delta?["tool_calls"] is JsonArray toolCallsJson)
+            {
+                toolDeltas = new List<ToolCallDelta>();
+                foreach (var tc in toolCallsJson)
+                {
+                    int index = 0;
+                    if (tc?["index"] is JsonValue idxVal)
+                    {
+                        if (idxVal.TryGetValue<int>(out var parsedInt))
+                        {
+                            index = parsedInt;
+                        }
+                        else if (int.TryParse(idxVal.ToString(), out var parsedStr))
+                        {
+                            index = parsedStr;
+                        }
+                    }
+
+                    var id = tc?["id"]?.GetValue<string?>();
+                    var fn = tc?["function"];
+                    var fnName = fn?["name"]?.GetValue<string?>();
+                    var fnArgs = fn?["arguments"]?.GetValue<string?>();
+                    toolDeltas.Add(new ToolCallDelta(index, id, fnName, fnArgs));
+                }
+            }
+
+            if (!string.IsNullOrEmpty(text) || !string.IsNullOrEmpty(reasoning) || toolDeltas != null || finishReason != null)
+            {
+                return new ChatStreamChunk(text, reasoning, toolDeltas, finishReason);
+            }
+        }
+
+        return null;
     }
 
     public async Task<ChatCompletionResult> CompleteAsync(

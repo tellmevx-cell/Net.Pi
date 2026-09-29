@@ -79,8 +79,20 @@ public class AgentConsoleRenderer
                     Console.WriteLine(Ansi.RedText($"[ERROR] {err.Message}"));
                     break;
 
-                case AgentRunCompleted:
+                case AgentRunCompleted runDone:
                     Console.WriteLine();
+                    if (runDone.Status == AgentRunStatus.Cancelled)
+                    {
+                        Console.WriteLine(Ansi.YellowText($"\n⏹  Execution cancelled ({runDone.Message ?? "by user"})."));
+                    }
+                    else if (runDone.Status == AgentRunStatus.MaxTurnsReached)
+                    {
+                        Console.WriteLine(Ansi.YellowText($"\n⚠️  Max turns limit reached ({runDone.TotalTurns} turns). Send a new prompt to continue."));
+                    }
+                    else if (runDone.Status == AgentRunStatus.Error)
+                    {
+                        Console.WriteLine(Ansi.RedText($"\n✗  Run stopped with error: {runDone.Message}"));
+                    }
                     break;
             }
         }

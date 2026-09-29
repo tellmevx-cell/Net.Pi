@@ -53,9 +53,11 @@ public class GlobTool : ITool
                 return Task.FromResult(ToolResult.Error("Missing required parameter: 'pattern'."));
             }
 
-            var baseDir = string.IsNullOrWhiteSpace(path)
-                ? _workspaceRoot
-                : (Path.IsPathRooted(path) ? path : Path.Combine(_workspaceRoot, path));
+            var (isAllowed, baseDir, errMsg) = string.IsNullOrWhiteSpace(path)
+                ? (true, _workspaceRoot, null)
+                : PathGuard.ResolveAndValidate(_workspaceRoot, path);
+
+            if (!isAllowed) return Task.FromResult(ToolResult.Error(errMsg!));
 
             if (!Directory.Exists(baseDir))
             {

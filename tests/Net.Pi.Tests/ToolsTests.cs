@@ -1,3 +1,5 @@
+using Net.Pi.Ai.Models;
+using Net.Pi.Core;
 using Net.Pi.Tools;
 using Xunit;
 
@@ -52,6 +54,33 @@ public class ToolsTests : IDisposable
     }
 
     [Fact]
+    public async Task EditFile_EmptyOldString_ReturnsErrorWithoutHanging()
+    {
+        var writeTool = new WriteFileTool(_tempDir);
+        var editTool = new EditFileTool(_tempDir);
+
+        await writeTool.ExecuteAsync("{\"path\":\"app.cs\", \"content\":\"int x = 1;\"}");
+        var editRes = await editTool.ExecuteAsync("{\"path\":\"app.cs\", \"old_string\":\"\", \"new_string\":\"42;\"}");
+        Assert.True(editRes.IsError);
+        Assert.Contains("cannot be null or empty", editRes.Content);
+    }
+
+    [Fact]
+    public async Task PathGuard_DisallowsPathTraversal()
+    {
+        var writeTool = new WriteFileTool(_tempDir);
+        var readTool = new ReadFileTool(_tempDir);
+
+        var writeRes = await writeTool.ExecuteAsync("{\"path\":\"../../escaped.txt\", \"content\":\"dangerous\"}");
+        Assert.True(writeRes.IsError);
+        Assert.Contains("Path traversal is prohibited", writeRes.Content);
+
+        var readRes = await readTool.ExecuteAsync("{\"path\":\"../../windows/system32/cmd.exe\"}");
+        Assert.True(readRes.IsError);
+        Assert.Contains("Path traversal is prohibited", readRes.Content);
+    }
+
+    [Fact]
     public async Task ListDir_ListsCreatedFiles()
     {
         var writeTool = new WriteFileTool(_tempDir);
@@ -93,5 +122,32 @@ public class ToolsTests : IDisposable
         Assert.False(grepRes.IsError);
         Assert.Contains("config.json:2:", grepRes.Content);
         Assert.Contains("\"port\": 8080", grepRes.Content);
+    }
+
+    [Fact]
+    public void ContextCompactor_TruncatesOldToolOutputsAndSummarizes()
+    {
+        var compactor = new ContextCompactor(new ContextCompactorOptions
+        {
+            MaxContextTokens = 100, // force compaction
+            PreserveRecentTurns = 2,
+            MaxToolResultCharacters = 50
+        });
+
+        var history = new List<ChatMessage>
+        {
+            ChatMessage.System("System prompt"),
+            ChatMessage.User("User request 1"),
+            ChatMessage.Assistant("Assistant response 1"),
+            ChatMessage.ToolResult("t1", new string('X', 500)), // large tool output
+            ChatMessage.User("User request 2"),
+            ChatMessage.Assistant("Assistant response 2"),
+            ChatMessage.User("User request 3"),
+            ChatMessage.Assistant("Assistant response 3")
+        };
+
+        var compacted = compactor.CompactIfNeeded(history);
+        Assert.True(compacted);
+        Assert.Contains(history, m => m.Content != null && m.Content.Contains("Summary of earlier conversation turns"));
     }
 }
